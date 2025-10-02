@@ -1,0 +1,24 @@
+{
+  "name": "realtime-agent",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@fastify/formbody": "^8.0.2",
+    "@fastify/websocket": "^11.2.0",
+    "@ibm/mapepire-js": "^0.6.0",
+    "@openai/agents": "^0.1.9",
+    "@openai/agents-extensions": "^0.1.5",
+    "@openai/agents-realtime": "^0.1.8",
+    "dotenv": "^17.2.3",
+    "fastify": "^5.6.1",
+    "zod": "^3.25.76"
+  }
+}
