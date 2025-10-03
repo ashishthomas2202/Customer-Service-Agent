@@ -1,29 +1,52 @@
 // csrAgent.js
 import { RealtimeAgent, tool, backgroundResult } from "@openai/agents/realtime";
 import { z } from "zod";
-import { Db, DatabaseServer } from "./utils/mapepire.js";
+// import { Db, DatabaseServer } from "./utils/mapepire.js";
+
+import { getDb } from "./utils/mapepire.js";
 
 // ---------- DB init + helpers ----------
-const db = new Db();
-await db.connect(DatabaseServer);
+// const db = new Db();
+// await db.connect(DatabaseServer);
 
 // Pick your library/schema via env (default IRISLIB). Db2 for i likes uppercase schema names.
 const SCHEMA = (process.env.DB_SCHEMA || "IRISLIB").toUpperCase();
 const T = (name) => `${SCHEMA}.${name}`;
 
-// Set the default/current schema once (so unqualified names still work if you add any later)
-try {
-  await db.query(`SET CURRENT SCHEMA ${SCHEMA}`);
-  console.log(`Current schema set to ${SCHEMA}`);
-} catch (e) {
-  console.warn(
-    "Could not SET CURRENT SCHEMA; will rely on qualified names only.",
-    e?.message || e
-  );
+let schemaReady = false;
+async function ensureSchema() {
+  if (schemaReady) return true;
+  const db = await getDb();
+  if (!db) return false; // ← let caller decide what to do
+  try {
+    await db.query(`SET CURRENT SCHEMA ${SCHEMA}`);
+    console.log(`Current schema set to ${SCHEMA}`);
+  } catch (e) {
+    console.warn(
+      "Could not SET CURRENT SCHEMA; relying on qualified names only.",
+      e?.message || e
+    );
+  }
+  schemaReady = true;
+  return true;
 }
 
-// Simple query helper with strong logging
+// Set the default/current schema once (so unqualified names still work if you add any later)
+// try {
+//   await db.query(`SET CURRENT SCHEMA ${SCHEMA}`);
+//   console.log(`Current schema set to ${SCHEMA}`);
+// } catch (e) {
+//   console.warn(
+//     "Could not SET CURRENT SCHEMA; will rely on qualified names only.",
+//     e?.message || e
+//   );
+// }
+
+// Simple query helper with strong logging + lazy DB
 async function q(sql, params = []) {
+  const db = await getDb();
+  if (!db) throw new Error("db_unavailable");
+  await ensureSchema();
   try {
     const res = await db.query(sql, params);
     const rows = res?.data || res?.rows || res || [];
@@ -40,6 +63,24 @@ async function q(sql, params = []) {
     throw err;
   }
 }
+// // Simple query helper with strong logging
+// async function q(sql, params = []) {
+//   try {
+//     const res = await db.query(sql, params);
+//     const rows = res?.data || res?.rows || res || [];
+//     console.log(
+//       "SQL OK:",
+//       sql,
+//       params,
+//       "→",
+//       Array.isArray(rows) ? rows.length : typeof rows
+//     );
+//     return rows;
+//   } catch (err) {
+//     console.error("SQL FAIL:", sql, params, "\n", err?.message || err);
+//     throw err;
+//   }
+// }
 
 const maskEmail = (e) => (e ? e.replace(/(.).+(@.+)/, "$1***$2") : "");
 const maskPhone = (p) => (p ? p.replace(/(\d{3}).+(\d{2})$/, "$1***$2") : "");
