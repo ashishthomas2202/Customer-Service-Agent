@@ -24,7 +24,6 @@ function bufferToPem(buf) {
 }
 
 async function fetchCert(host) {
-  // Will open a socket to host:port to retrieve the leaf cert.
   const cert = await getCertificate({ host });
   const pem = cert.pem || (cert.raw ? bufferToPem(cert.raw) : undefined);
   const raw = cert.raw || (pem ? Buffer.from(pem) : undefined);
@@ -41,10 +40,11 @@ function readDbEnv() {
       ? process.env.DB_CERT_PATH
       : join(process.cwd(), process.env.DB_CERT_PATH)
     : null;
-  const DB_CA_PEM = process.env.DB_CA_PEM || ""; // ← inline PEM allowed
+  const DB_CA_PEM = process.env.DB_CA_PEM || ""; // inline PEM
   const DB_TLS_INSECURE = /^true|1$/i.test(
     process.env.DB_TLS_INSECURE || "false"
   );
+  const DB_LOG_CONFIG = /^true|1$/i.test(process.env.DB_LOG_CONFIG || "false");
   return {
     DB_HOST,
     DB_USER,
@@ -53,36 +53,31 @@ function readDbEnv() {
     DB_CERT_PATH,
     DB_CA_PEM,
     DB_TLS_INSECURE,
+    DB_LOG_CONFIG,
   };
 }
 
 function pemFromEnvOrFile({ DB_CERT_PATH, DB_CA_PEM }) {
-  if (DB_CA_PEM && DB_CA_PEM.includes("BEGIN CERTIFICATE")) {
-    // Prefer inline env PEM if provided
-    return DB_CA_PEM;
-  }
-  if (DB_CERT_PATH && existsSync(DB_CERT_PATH)) {
+  if (DB_CA_PEM && DB_CA_PEM.includes("BEGIN CERTIFICATE")) return DB_CA_PEM;
+  if (DB_CERT_PATH && existsSync(DB_CERT_PATH))
     return readFileSync(DB_CERT_PATH, "utf8");
-  }
   return null;
 }
 
 async function ensureCertificate({ host, certPath, inlinePem }) {
-  // 1) Inline env or file → no network call
-  if (inlinePem) {
+  // 1) Inline/file PEM → no network
+  if (inlinePem)
     return {
       pem: inlinePem,
       raw: Buffer.from(inlinePem),
       subject: null,
       san: null,
     };
-  }
   if (certPath && existsSync(certPath)) {
     const pem = readFileSync(certPath, "utf8");
     return { pem, raw: Buffer.from(pem), subject: null, san: null };
   }
-
-  // 2) Fallback: live fetch (requires host:port reachable)
+  // 2) Fallback to live fetch (requires open port)
   const cert = await fetchCert(host);
   if (certPath) {
     try {
@@ -106,15 +101,39 @@ export async function getDatabaseServer() {
     DB_CERT_PATH,
     DB_CA_PEM,
     DB_TLS_INSECURE,
+    DB_LOG_CONFIG,
   } = env;
 
   if (!DB_HOST || !DB_USER || !DB_PASS) {
     console.warn(
       "DB env missing; database will be unavailable (boot continues)."
     );
-    return null; // non-fatal
+    return null;
   }
 
+  // ---------- IMPORTANT: In INSECURE mode, do NOT fetch any certs ----------
+  if (DB_TLS_INSECURE) {
+    const server = {
+      host: DB_HOST,
+      user: DB_USER,
+      password: DB_PASS,
+      ignoreUnauthorized: true, // ← accept self-signed / no CA
+    };
+    // still set SNI if you supplied it or it’s needed for IP hostnames
+    const needSni = isIpHost(DB_HOST) || !!DB_SNI;
+    const servername = DB_SNI || "";
+    if (needSni && servername) server.tls = { servername };
+    if (DB_LOG_CONFIG) {
+      console.log("DB server (insecure):", {
+        host: DB_HOST,
+        sni: servername || null,
+      });
+    }
+    cachedServer = server;
+    return cachedServer;
+  }
+
+  // ---------- Secure mode: use inline PEM / file / (last resort) fetch ----------
   try {
     const inlinePem = pemFromEnvOrFile({ DB_CERT_PATH, DB_CA_PEM });
     const cert = await ensureCertificate({
@@ -130,21 +149,25 @@ export async function getDatabaseServer() {
     const caValue = cert.pem || cert.raw;
 
     const server = {
-      host: DB_HOST, // may include :port
+      host: DB_HOST,
       user: DB_USER,
       password: DB_PASS,
-      // If DB_TLS_INSECURE, skip verification (TEST ONLY). Otherwise provide CA.
-      ...(DB_TLS_INSECURE
-        ? { ignoreUnauthorized: true }
-        : { ca: caValue, ignoreUnauthorized: false }),
+      ca: caValue,
+      ignoreUnauthorized: false,
     };
     if (needSni && servername) server.tls = { servername };
-
+    if (DB_LOG_CONFIG) {
+      console.log("DB server (secure):", {
+        host: DB_HOST,
+        sni: servername || null,
+        caProvided: !!caValue,
+      });
+    }
     cachedServer = server;
     return cachedServer;
   } catch (e) {
     console.error("DB certificate preparation failed:", e?.message || e);
-    return null; // non-fatal
+    return null;
   }
 }
 
@@ -154,7 +177,7 @@ export class Db {
   }
   async connect(server) {
     if (!server) throw new Error("No database server config");
-    // If secure mode but no CA present, try to fetch (network) as last resort
+    // If secure mode AND no CA present, try to fetch as last resort (won’t run in insecure mode)
     if (!server.ignoreUnauthorized && !server.ca) {
       const cert = await fetchCert(server.host);
       server.ca = cert.pem || cert.raw;
@@ -189,9 +212,9 @@ export async function getDb() {
   connecting = (async () => {
     try {
       const server = await getDatabaseServer();
-      if (!server) return null; // env/cert missing → non-fatal
+      if (!server) return null;
       const db = new Db();
-      await db.connect(server); // throws on failure
+      await db.connect(server);
       cachedDb = db;
       return cachedDb;
     } catch (e) {
@@ -205,435 +228,3 @@ export async function getDb() {
 
   return connecting;
 }
-
-// // utils/mapepire.js
-// import mapepire from "@ibm/mapepire-js";
-// import { writeFileSync, mkdirSync, existsSync, readFileSync } from "fs";
-// import { dirname, join } from "path";
-// import { fileURLToPath } from "url";
-
-// const { Pool, getCertificate } = mapepire;
-// const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// function isIpHost(hostWithPort = "") {
-//   const host = String(hostWithPort).split(":")[0];
-//   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":"); // ipv4/ipv6
-// }
-// function firstDnsFromSAN(san = "") {
-//   const m = san?.match?.(/DNS:([^,\s]+)/i);
-//   return m ? m[1] : null;
-// }
-// function bufferToPem(buf) {
-//   const b64 = Buffer.isBuffer(buf)
-//     ? buf.toString("base64")
-//     : Buffer.from(buf).toString("base64");
-//   const lines = b64.match(/.{1,64}/g).join("\n");
-//   return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----\n`;
-// }
-
-// async function fetchCert(host) {
-//   const cert = await getCertificate({ host });
-//   const pem = cert.pem || (cert.raw ? bufferToPem(cert.raw) : undefined);
-//   const raw = cert.raw || (pem ? Buffer.from(pem) : undefined);
-//   return { pem, raw, subject: cert.subject, san: cert.subjectAltName };
-// }
-
-// async function ensureCertificate({ host, certPath }) {
-//   if (certPath && existsSync(certPath)) {
-//     const pem = readFileSync(certPath, "utf8");
-//     return { pem, raw: Buffer.from(pem), subject: null, san: null };
-//   }
-//   const cert = await fetchCert(host);
-//   if (certPath) {
-//     try {
-//       mkdirSync(dirname(certPath), { recursive: true });
-//       writeFileSync(certPath, cert.pem, "utf8");
-//     } catch {}
-//   }
-//   return cert;
-// }
-
-// function readDbEnv() {
-//   const DB_HOST = process.env.DB_HOST || process.env.DB2_HOST;
-//   const DB_USER = process.env.DB_ID || process.env.DB2_USER;
-//   const DB_PASS = process.env.DB_PASSWORD || process.env.DB2_PASS;
-//   const DB_SNI = process.env.DB_SNI || process.env.DB2_SNI || "";
-//   const DB_CERT_PATH = process.env.DB_CERT_PATH
-//     ? process.env.DB_CERT_PATH.startsWith("/")
-//       ? process.env.DB_CERT_PATH
-//       : join(process.cwd(), process.env.DB_CERT_PATH)
-//     : null;
-//   return { DB_HOST, DB_USER, DB_PASS, DB_SNI, DB_CERT_PATH };
-// }
-
-// let cachedServer = null;
-// export async function getDatabaseServer() {
-//   if (cachedServer) return cachedServer;
-
-//   const { DB_HOST, DB_USER, DB_PASS, DB_SNI, DB_CERT_PATH } = readDbEnv();
-//   if (!DB_HOST || !DB_USER || !DB_PASS) {
-//     console.warn(
-//       "DB env missing; database will be unavailable (boot continues)."
-//     );
-//     return null; // non-fatal
-//   }
-
-//   try {
-//     const cert = await ensureCertificate({
-//       host: DB_HOST,
-//       certPath: DB_CERT_PATH,
-//     });
-
-//     let servername =
-//       DB_SNI || firstDnsFromSAN(cert.san) || cert.subject?.CN || "";
-//     const needSni =
-//       isIpHost(DB_HOST) || (servername && !DB_HOST.startsWith(servername));
-//     const caValue = cert.pem || cert.raw;
-
-//     const server = {
-//       host: DB_HOST, // may include :port
-//       user: DB_USER,
-//       password: DB_PASS,
-//       ca: caValue,
-//       ignoreUnauthorized: false,
-//     };
-//     if (needSni && servername) server.tls = { servername };
-
-//     cachedServer = server;
-//     return cachedServer;
-//   } catch (e) {
-//     console.error("DB certificate fetch failed:", e?.message || e);
-//     return null; // non-fatal
-//   }
-// }
-
-// export class Db {
-//   constructor() {
-//     this.pool = undefined;
-//   }
-//   async connect(server) {
-//     if (!server) throw new Error("No database server config");
-
-//     // Ensure CA + SNI if missing
-//     if (!server.ca) {
-//       const cert = await fetchCert(server.host);
-//       server.ca = cert.pem || cert.raw;
-//       if ((!server.tls || !server.tls.servername) && isIpHost(server.host)) {
-//         const guess = firstDnsFromSAN(cert.san) || cert.subject?.CN || "";
-//         if (guess) server.tls = { ...(server.tls || {}), servername: guess };
-//       }
-//       if (!server.ignoreUnauthorized) server.ignoreUnauthorized = false;
-//     }
-
-//     this.pool = new Pool({ creds: server, maxSize: 5, startingSize: 1 });
-//     await this.pool.init();
-//   }
-//   async query(sql, params = []) {
-//     if (!this.pool) throw new Error("Database not connected");
-//     return this.pool.execute(sql, { parameters: params });
-//   }
-// }
-
-// // ---------- Lazy singleton with invalidation & single-flight ----------
-
-// let cachedDb = null;
-// let connecting = null; // share an in-flight connect among callers
-
-// export function invalidateDb() {
-//   cachedDb = null;
-//   connecting = null;
-// }
-
-// export async function getDb() {
-//   if (cachedDb) return cachedDb;
-//   if (connecting) return connecting;
-
-//   connecting = (async () => {
-//     try {
-//       const server = await getDatabaseServer();
-//       if (!server) return null; // env/cert missing → non-fatal
-//       const db = new Db();
-//       await db.connect(server); // throws on failure
-//       cachedDb = db;
-//       return cachedDb;
-//     } catch (e) {
-//       console.error("DB connect failed:", e?.message || e);
-//       cachedDb = null;
-//       return null;
-//     } finally {
-//       connecting = null;
-//     }
-//   })();
-
-//   return connecting;
-// }
-
-// // // utils/mapepire.js
-// // import mapepire from "@ibm/mapepire-js";
-// // import { writeFileSync, mkdirSync, existsSync, readFileSync } from "fs";
-// // import { dirname, join } from "path";
-// // import { fileURLToPath } from "url";
-
-// // const { Pool, getCertificate } = mapepire;
-// // const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// // function isIpHost(hostWithPort = "") {
-// //   const host = String(hostWithPort).split(":")[0];
-// //   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":"); // ipv4/ipv6
-// // }
-// // function firstDnsFromSAN(san = "") {
-// //   const m = san?.match?.(/DNS:([^,\s]+)/i);
-// //   return m ? m[1] : null;
-// // }
-// // function bufferToPem(buf) {
-// //   const b64 = Buffer.isBuffer(buf)
-// //     ? buf.toString("base64")
-// //     : Buffer.from(buf).toString("base64");
-// //   const lines = b64.match(/.{1,64}/g).join("\n");
-// //   return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----\n`;
-// // }
-
-// // async function fetchCert(host) {
-// //   const cert = await getCertificate({ host });
-// //   const pem = cert.pem || (cert.raw ? bufferToPem(cert.raw) : undefined);
-// //   const raw = cert.raw || (pem ? Buffer.from(pem) : undefined);
-// //   return { pem, raw, subject: cert.subject, san: cert.subjectAltName };
-// // }
-
-// // async function ensureCertificate({ host, certPath }) {
-// //   if (certPath && existsSync(certPath)) {
-// //     const pem = readFileSync(certPath, "utf8");
-// //     return { pem, raw: Buffer.from(pem), subject: null, san: null };
-// //   }
-// //   const cert = await fetchCert(host);
-// //   if (certPath) {
-// //     try {
-// //       mkdirSync(dirname(certPath), { recursive: true });
-// //       writeFileSync(certPath, cert.pem, "utf8");
-// //     } catch {}
-// //   }
-// //   return cert;
-// // }
-
-// // function readDbEnv() {
-// //   const DB_HOST = process.env.DB_HOST || process.env.DB2_HOST;
-// //   const DB_USER = process.env.DB_ID || process.env.DB2_USER;
-// //   const DB_PASS = process.env.DB_PASSWORD || process.env.DB2_PASS;
-// //   const DB_SNI = process.env.DB_SNI || process.env.DB2_SNI || "";
-// //   const DB_CERT_PATH = process.env.DB_CERT_PATH
-// //     ? process.env.DB_CERT_PATH.startsWith("/")
-// //       ? process.env.DB_CERT_PATH
-// //       : join(process.cwd(), process.env.DB_CERT_PATH)
-// //     : null;
-// //   return { DB_HOST, DB_USER, DB_PASS, DB_SNI, DB_CERT_PATH };
-// // }
-
-// // let cachedServer = null;
-// // export async function getDatabaseServer() {
-// //   if (cachedServer) return cachedServer;
-
-// //   const { DB_HOST, DB_USER, DB_PASS, DB_SNI, DB_CERT_PATH } = readDbEnv();
-// //   if (!DB_HOST || !DB_USER || !DB_PASS) {
-// //     console.warn(
-// //       "DB env missing; database will be unavailable (boot continues)."
-// //     );
-// //     return null; // ← non-fatal
-// //   }
-
-// //   try {
-// //     const cert = await ensureCertificate({
-// //       host: DB_HOST,
-// //       certPath: DB_CERT_PATH,
-// //     });
-// //     // console.log("Mapepire cert:", { CN: cert.subject?.CN, SAN: cert.san }); // optional debug
-
-// //     let servername =
-// //       DB_SNI || firstDnsFromSAN(cert.san) || cert.subject?.CN || "";
-// //     const needSni =
-// //       isIpHost(DB_HOST) || (servername && !DB_HOST.startsWith(servername));
-// //     const caValue = cert.pem || cert.raw;
-
-// //     const server = {
-// //       host: DB_HOST,
-// //       user: DB_USER,
-// //       password: DB_PASS,
-// //       ca: caValue,
-// //       ignoreUnauthorized: false,
-// //     };
-// //     if (needSni && servername) server.tls = { servername };
-
-// //     cachedServer = server;
-// //     return cachedServer;
-// //   } catch (e) {
-// //     console.error("DB certificate fetch failed:", e?.message || e);
-// //     return null; // ← non-fatal
-// //   }
-// // }
-
-// // export class Db {
-// //   constructor() {
-// //     this.pool = undefined;
-// //   }
-// //   async connect(server) {
-// //     if (!server) throw new Error("No database server config");
-// //     if (!server.ca) {
-// //       const cert = await fetchCert(server.host);
-// //       server.ca = cert.pem || cert.raw;
-// //       if ((!server.tls || !server.tls.servername) && isIpHost(server.host)) {
-// //         const guess = firstDnsFromSAN(cert.san) || cert.subject?.CN || "";
-// //         if (guess) server.tls = { ...(server.tls || {}), servername: guess };
-// //       }
-// //       if (!server.ignoreUnauthorized) server.ignoreUnauthorized = false;
-// //     }
-// //     this.pool = new Pool({ creds: server, maxSize: 5, startingSize: 1 });
-// //     await this.pool.init();
-// //   }
-// //   async query(sql, params = []) {
-// //     if (!this.pool) throw new Error("Database not connected");
-// //     return this.pool.execute(sql, { parameters: params });
-// //   }
-// // }
-
-// // // Lazy singleton connection
-// // let cachedDb = null;
-// // export async function getDb() {
-// //   if (cachedDb) return cachedDb;
-// //   try {
-// //     const server = await getDatabaseServer();
-// //     if (!server) return null;
-// //     const db = new Db();
-// //     await db.connect(server);
-// //     cachedDb = db;
-// //     return cachedDb;
-// //   } catch (e) {
-// //     console.error("DB connect failed:", e?.message || e);
-// //     return null; // ← non-fatal
-// //   }
-// // }
-// // // utils/mapepire.js
-// // import mapepire from "@ibm/mapepire-js";
-// // import { writeFileSync, mkdirSync, existsSync, readFileSync } from "fs";
-// // import { dirname, join } from "path";
-// // import { fileURLToPath } from "url";
-
-// // const { Pool, getCertificate } = mapepire;
-// // const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// // function isIpHost(hostWithPort = "") {
-// //   const host = String(hostWithPort).split(":")[0];
-// //   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":"); // ipv4/ipv6
-// // }
-// // function firstDnsFromSAN(san = "") {
-// //   const m = san.match(/DNS:([^,\s]+)/i);
-// //   return m ? m[1] : null;
-// // }
-
-// // async function fetchCert(host) {
-// //   const cert = await getCertificate({ host });
-// //   // Some versions expose .pem and .raw; normalize so we always return PEM string and raw Buffer.
-// //   const pem = cert.pem || (cert.raw ? bufferToPem(cert.raw) : undefined);
-// //   const raw = cert.raw || (pem ? Buffer.from(pem) : undefined);
-// //   if (!pem && !raw) throw new Error("Could not obtain server certificate");
-// //   return { pem, raw, subject: cert.subject, san: cert.subjectAltName };
-// // }
-
-// // function bufferToPem(buf) {
-// //   const b64 = Buffer.isBuffer(buf)
-// //     ? buf.toString("base64")
-// //     : Buffer.from(buf).toString("base64");
-// //   const lines = b64.match(/.{1,64}/g).join("\n");
-// //   return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----\n`;
-// // }
-
-// // async function ensureCertificate({ host, certPath }) {
-// //   // If a cache path is provided and exists, use it as PEM string
-// //   if (certPath && existsSync(certPath)) {
-// //     const pem = readFileSync(certPath, "utf8");
-// //     return { pem, raw: Buffer.from(pem), subject: null, san: null };
-// //   }
-// //   const cert = await fetchCert(host);
-// //   if (certPath) {
-// //     try {
-// //       mkdirSync(dirname(certPath), { recursive: true });
-// //       writeFileSync(certPath, cert.pem, "utf8");
-// //     } catch {
-// //       /* ignore */
-// //     }
-// //   }
-// //   return cert;
-// // }
-
-// // export async function buildServerFromEnv() {
-// //   const DB_HOST = process.env.DB_HOST || process.env.DB2_HOST;
-// //   const DB_USER = process.env.DB_ID || process.env.DB2_USER;
-// //   const DB_PASS = process.env.DB_PASSWORD || process.env.DB2_PASS;
-// //   const DB_SNI = process.env.DB_SNI || process.env.DB2_SNI || "";
-// //   const DB_CERT_PATH = process.env.DB_CERT_PATH
-// //     ? process.env.DB_CERT_PATH.startsWith("/")
-// //       ? process.env.DB_CERT_PATH
-// //       : join(process.cwd(), process.env.DB_CERT_PATH)
-// //     : null; // no cache by default; set DB_CERT_PATH=./certs/mapepire.pem to cache
-
-// //   if (!DB_HOST || !DB_USER || !DB_PASS) {
-// //     throw new Error(
-// //       "Missing DB_HOST/DB2_HOST, DB_ID/DB2_USER, or DB_PASSWORD/DB2_PASS"
-// //     );
-// //   }
-
-// //   const cert = await ensureCertificate({
-// //     host: DB_HOST,
-// //     certPath: DB_CERT_PATH,
-// //   });
-
-// //   // Helpful one-time log:
-// //   console.log("Mapepire cert:", { CN: cert.subject?.CN, SAN: cert.san });
-
-// //   let servername =
-// //     DB_SNI || firstDnsFromSAN(cert.san) || cert.subject?.CN || "";
-// //   const needSni =
-// //     isIpHost(DB_HOST) || (servername && !DB_HOST.startsWith(servername));
-
-// //   // IMPORTANT: give TLS a concrete ca (string PEM or Buffer). Do NOT pass [undefined].
-// //   const caValue = cert.pem || cert.raw; // prefer PEM string
-
-// //   const server = {
-// //     host: DB_HOST, // include port; no protocol prefix
-// //     user: DB_USER,
-// //     password: DB_PASS,
-// //     ca: caValue, // <- string or Buffer; valid type
-// //     ignoreUnauthorized: false, // verify using our CA
-// //   };
-// //   if (needSni && servername) server.tls = { servername };
-
-// //   return server;
-// // }
-
-// // export class Db {
-// //   constructor() {
-// //     this.pool = undefined;
-// //   }
-
-// //   // server: { host, user, password, ca, ignoreUnauthorized, tls? }
-// //   async connect(server) {
-// //     // If no CA provided, fetch and attach one now
-// //     if (!server.ca) {
-// //       const cert = await fetchCert(server.host);
-// //       server.ca = cert.pem || cert.raw;
-// //       if (!server.ignoreUnauthorized) server.ignoreUnauthorized = false;
-// //       if ((!server.tls || !server.tls.servername) && isIpHost(server.host)) {
-// //         const guess = firstDnsFromSAN(cert.san) || cert.subject?.CN || "";
-// //         if (guess) server.tls = { ...(server.tls || {}), servername: guess };
-// //       }
-// //     }
-// //     this.pool = new Pool({ creds: server, maxSize: 5, startingSize: 1 });
-// //     await this.pool.init();
-// //   }
-
-// //   async query(statement, bindingsValues = []) {
-// //     if (!this.pool) throw new Error("Database not connected");
-// //     return this.pool.execute(statement, { parameters: bindingsValues });
-// //   }
-// // }
-
-// // // Ready-to-use server from env (keep your old shape)
-// // export const DatabaseServer = await buildServerFromEnv();
