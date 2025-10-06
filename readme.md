@@ -331,4 +331,4 @@ Watch your terminal for **tool calls and SQL** (success and row counts).
 - The agent can reply in whatever language the caller speaks (no settings required).
 - You can customize tools, approvals, and prompts in `csrAgent.js` (or your agent file).
 
-Happy demoing! 🎤📞💬🗄️
+Happy demoing!
